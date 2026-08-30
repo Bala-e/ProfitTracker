@@ -53,6 +53,12 @@ const sb = CONFIGURED ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPAB
 const money = (n) => CFG.CURRENCY + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(Number(n || 0));
 const BANDS = [25, 50, 100, 250, 500, 1000];
 const gramsLabel = (g) => g >= 1000 ? (g/1000) + "kg" : g + "g";
+// packet-priced products store grams=0 on sales rows (sentinel, no schema change needed on `sales`);
+// price_per_100g/cost_per_100g are reused as "price per packet" / "cost per packet" for those products
+const isPacket = (p) => !!p && p.unit === 'packet';
+const saleAmountFor = (p, grams, qty) => isPacket(p) ? p.price_per_100g * qty : p.price_per_100g * grams/100 * qty;
+const costAmountFor = (p, grams, qty) => isPacket(p) ? p.cost_per_100g * qty : p.cost_per_100g * grams/100 * qty;
+const unitSuffix = (p) => isPacket(p) ? "/packet" : "/100g";
 const startOf = (kind) => {
   const d = new Date(); d.setHours(0,0,0,0);
   if (kind === 'today') return d;
@@ -139,158 +145,387 @@ function Toast({ msg }) {
   );
 }
 
-/* ================= EMPLOYEE — LOG A SALE ================= */
-function SaleScreen({ products, sales, reload, toast, goOwner }) {
-  const [q, setQ] = useState("");
-  const [pick, setPick] = useState(null);
+/* ================= EMPLOYEE — WEIGHT/QTY PICKER MODAL ================= */
+function ProductPicker({ product, onAdd, onClose }) {
+  const packet = isPacket(product);
   const [grams, setGrams] = useState(100);
   const [qty, setQty] = useState(1);
-  const [name, setName] = useState(localStorage.getItem('dk_seller') || "");
-  const [saving, setSaving] = useState(false);
-  const [paid, setPaid] = useState("");
-  const [paidTouched, setPaidTouched] = useState(false);
-
-  const active = products.filter(p => p.active !== false);
-  const list = active.filter(p => p.name.toLowerCase().includes(q.toLowerCase()));
-  const listAmount = pick ? pick.price_per_100g * grams/100 * qty : 0;
-
-  useEffect(() => {
-    if (!paidTouched) setPaid(listAmount ? listAmount.toFixed(2) : "");
-  }, [listAmount, paidTouched]);
-
-  const today = sales.filter(s => new Date(s.created_at) >= startOf('today'));
-  const todayTotal = today.reduce((a,s)=>a+Number(s.sale_amount),0);
-
-  const save = async () => {
-    if (!pick) return;
-    const sale_amount = +paid || 0;
-    if (sale_amount <= 0) { toast("Enter the amount received"); return; }
-    setSaving(true);
-    localStorage.setItem('dk_seller', name);
-    const cost_amount = pick.cost_per_100g  * grams/100 * qty;
-    const { error } = await sb.from('sales').insert({
-      product_id: pick.id, product_name: pick.name, grams, qty,
-      sale_amount, cost_amount, profit: sale_amount - cost_amount, sold_by: name || null
-    });
-    setSaving(false);
-    if (error) { toast("Couldn't save — check connection"); return; }
-    toast("Sale saved");
-    setPick(null); setQ(""); setGrams(100); setQty(1); setPaid(""); setPaidTouched(false); reload();
-  };
-
-  const del = async (id) => {
-    if (!confirm("Remove this sale?")) return;
-    await sb.from('sales').delete().eq('id', id); reload();
-  };
+  const amount = saleAmountFor(product, grams, qty);
 
   return (
-    <div className="max-w-md mx-auto px-4 pb-28">
-      <header className="pt-6 pb-4">
-        <p className="text-[#6B5D4F] text-sm">{CFG.SHOP_NAME}</p>
-        <div className="flex items-end justify-between">
-          <h1 className="font-display text-3xl font-semibold text-[#3B6B35] leading-tight">Log a sale</h1>
-          <button onClick={goOwner} aria-label="Owner login" className="flex items-center gap-1.5 text-sm text-[#6B5D4F] px-3 py-1.5 rounded-full border border-[#E3D8C3] active:bg-[#F2EAD8]">
-            <I.lock className="w-3.5 h-3.5" /> Owner
-          </button>
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40" onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()}
+        className="w-full sm:max-w-sm bg-white rounded-t-3xl sm:rounded-2xl p-5 max-h-[92vh] overflow-y-auto">
+        <div className="flex items-start justify-between mb-1">
+          <div>
+            <p className="font-display text-2xl font-semibold text-[#3A2E22]">{product.name}</p>
+            <p className="text-sm text-[#8A7B68]">{money(product.price_per_100g)} {packet ? "per packet" : "per 100g"}</p>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="text-[#8A7B68] text-2xl leading-none px-1">×</button>
         </div>
-      </header>
 
-      {/* today's running total */}
-      <div className="rounded-2xl bg-[#3B6B35] text-white px-5 py-4 mb-5">
-        <p className="text-[#CFE3B8] text-xs uppercase tracking-wide">Today's sales so far</p>
-        <p className="font-display text-3xl font-semibold mt-0.5">{money(todayTotal)}</p>
-        <p className="text-[#CFE3B8] text-xs mt-0.5">{today.length} {today.length===1?'sale':'sales'}</p>
-      </div>
-
-      {!pick ? (
-        <>
-          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search product…"
-            className="w-full rounded-xl border border-[#E3D8C3] bg-white px-4 py-3 mb-3 outline-none focus:border-[#3B6B35] focus:ring-2 focus:ring-[#3B6B35]/20" />
-          {active.length === 0 ? (
-            <p className="text-center text-[#8A7B68] py-10 text-sm">No products yet. Ask the owner to add them.</p>
-          ) : (
-            <div className="grid grid-cols-2 gap-2.5">
-              {list.map(p => (
-                <button key={p.id} onClick={()=>{setPick(p); setPaidTouched(false);}}
-                  className="text-left rounded-xl border border-[#E3D8C3] bg-white px-4 py-3.5 active:scale-[.98] active:bg-[#F7F1E3] transition">
-                  <p className="font-semibold text-[#3A2E22] leading-snug">{p.name}</p>
-                  <p className="text-sm text-[#8A7B68] mt-0.5">{money(p.price_per_100g)}<span className="text-xs">/100g</span></p>
-                </button>
+        {!packet && (
+          <>
+            <p className="text-xs font-semibold uppercase tracking-wide text-[#6B5D4F] mt-4 mb-2">Weight</p>
+            <div className="grid grid-cols-4 gap-2 mb-2">
+              {BANDS.map(g => (
+                <button key={g} onClick={()=>setGrams(g)}
+                  className={"rounded-xl py-3.5 text-sm font-semibold border transition " + (grams===g ? "bg-[#3B6B35] text-white border-[#3B6B35]" : "bg-white text-[#3A2E22] border-[#E3D8C3]")}>{gramsLabel(g)}</button>
               ))}
             </div>
-          )}
-        </>
+            <div className="flex items-center gap-2 mb-4">
+              <input type="number" min="0" inputMode="decimal" value={grams}
+                onChange={e=>setGrams(+e.target.value || 0)}
+                className="w-24 rounded-lg border border-[#E3D8C3] bg-white px-3 py-2 text-sm font-semibold text-center outline-none focus:border-[#3B6B35]" />
+              <span className="text-xs text-[#8A7B68]">grams — custom weight</span>
+            </div>
+          </>
+        )}
+
+        <p className="text-xs font-semibold uppercase tracking-wide text-[#6B5D4F] mb-2">{packet ? "Packets" : "Quantity"}</p>
+        <div className="flex items-center gap-3 mb-5">
+          <button onClick={()=>setQty(Math.max(1,qty-1))} className="w-12 h-12 rounded-xl border border-[#E3D8C3] text-2xl font-semibold active:bg-[#F2EAD8]">−</button>
+          <span className="w-10 text-center font-display text-2xl font-semibold">{qty}</span>
+          <button onClick={()=>setQty(qty+1)} className="w-12 h-12 rounded-xl border border-[#E3D8C3] text-2xl font-semibold active:bg-[#F2EAD8]">+</button>
+        </div>
+
+        <div className="flex items-center justify-between mb-4">
+          <span className="text-[#6B5D4F]">Amount</span>
+          <span className="font-display text-2xl font-semibold text-[#3B6B35]">{money(amount)}</span>
+        </div>
+
+        <button onClick={()=>onAdd(product, packet ? 0 : grams, qty)} disabled={!packet && grams<=0}
+          className="w-full rounded-xl bg-[#3B6B35] text-white py-4 font-semibold text-lg active:scale-[.99] disabled:opacity-50">
+          Add to bill
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ================= EMPLOYEE — CURRENT BILL PANEL ================= */
+function BillPanel({ cart, updateQty, setQtyExact, removeItem, changeGrams, name, setName, paid, onPaidEdit,
+                      listTotal, onSave, saving, saveError, onRetry, onHold, canHold, onClose }) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <p className="font-display text-xl font-semibold text-[#3A2E22]">Current bill</p>
+        <button onClick={onClose} className="lg:hidden text-sm text-[#6B5D4F] px-3 py-1 rounded-full border border-[#E3D8C3]">Close</button>
+      </div>
+
+      {cart.length === 0 ? (
+        <div className="text-center py-10 text-[#8A7B68] text-sm">
+          <p className="font-medium text-[#3A2E22] mb-1">Start a new sale</p>
+          <p>Tap a product above to add it to the bill.</p>
+        </div>
       ) : (
-        <div className="rounded-2xl border border-[#E3D8C3] bg-white p-5">
-          <button onClick={()=>setPick(null)} className="flex items-center gap-1 text-sm text-[#6B5D4F] mb-3"><I.back className="w-4 h-4"/> Change product</button>
-          <p className="font-display text-2xl font-semibold text-[#3A2E22]">{pick.name}</p>
-          <p className="text-sm text-[#8A7B68] mb-4">{money(pick.price_per_100g)} per 100g</p>
-
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#6B5D4F] mb-2">Weight</p>
-          <div className="grid grid-cols-3 gap-2 mb-2">
-            {BANDS.map(g => (
-              <button key={g} onClick={()=>setGrams(g)}
-                className={"rounded-lg py-2.5 text-sm font-semibold border transition " + (grams===g ? "bg-[#3B6B35] text-white border-[#3B6B35]" : "bg-white text-[#3A2E22] border-[#E3D8C3]")}>{gramsLabel(g)}</button>
-            ))}
+        <>
+          <div className="space-y-2 mb-4">
+            {cart.map(i => {
+              const packet = isPacket(i.product);
+              const amt = saleAmountFor(i.product, i.grams, i.qty);
+              return (
+                <div key={i.key} className="bg-[#FBF7EE] rounded-xl border border-[#EEE4D2] px-3.5 py-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-sm truncate">{i.product.name}</p>
+                      <p className="text-xs text-[#8A7B68]">{packet ? `${i.qty} packet${i.qty>1?'s':''}` : `${gramsLabel(i.grams)} × ${i.qty}`}</p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="font-semibold text-sm">{money(amt)}</span>
+                      <button onClick={()=>removeItem(i.key)} aria-label="Remove" className="text-[#C77] p-1"><I.trash className="w-4 h-4"/></button>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                    <button onClick={()=>updateQty(i.key,-1)} className="w-9 h-9 rounded-lg border border-[#E3D8C3] bg-white text-lg font-semibold">−</button>
+                    <input type="number" min="1" inputMode="numeric" value={i.qty}
+                      onChange={e=>setQtyExact(i.key, +e.target.value || 1)}
+                      className="w-12 text-center font-semibold text-sm rounded-lg border border-[#E3D8C3] py-1.5 outline-none focus:border-[#3B6B35]" />
+                    <button onClick={()=>updateQty(i.key,1)} className="w-9 h-9 rounded-lg border border-[#E3D8C3] bg-white text-lg font-semibold">+</button>
+                    <div className="flex-1"></div>
+                    {!packet && BANDS.map(g=>(
+                      <button key={g} onClick={()=>changeGrams(i.key,g)}
+                        className={"px-2 py-1.5 rounded-md text-xs font-semibold border " + (i.grams===g?"bg-[#3B6B35] text-white border-[#3B6B35]":"bg-white text-[#6B5D4F] border-[#E3D8C3]")}>{gramsLabel(g)}</button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
           </div>
-          <div className="flex items-center gap-2 mb-4">
-            <input type="number" min="0" inputMode="decimal" value={grams}
-              onChange={e=>setGrams(+e.target.value || 0)}
-              className="w-24 rounded-lg border border-[#E3D8C3] bg-white px-3 py-2 text-sm font-semibold text-center outline-none focus:border-[#3B6B35]" />
-            <span className="text-xs text-[#8A7B68]">grams — edit for exact weight (e.g. 105g)</span>
-          </div>
 
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#6B5D4F] mb-2">Quantity</p>
-          <div className="flex items-center gap-3 mb-5">
-            <button onClick={()=>setQty(Math.max(1,qty-1))} className="w-11 h-11 rounded-lg border border-[#E3D8C3] text-xl font-semibold">−</button>
-            <span className="w-10 text-center font-display text-2xl font-semibold">{qty}</span>
-            <button onClick={()=>setQty(qty+1)} className="w-11 h-11 rounded-lg border border-[#E3D8C3] text-xl font-semibold">+</button>
+          <div className="flex items-center justify-between border-t border-[#EEE4D2] pt-3 mb-3">
+            <span className="text-sm text-[#6B5D4F]">{cart.length} item{cart.length>1?'s':''}</span>
+            <span className="font-display text-xl font-semibold text-[#3A2E22]">{money(listTotal)}</span>
           </div>
 
           <input value={name} onChange={e=>setName(e.target.value)} placeholder="Your name (optional)"
-            className="w-full rounded-xl border border-[#E3D8C3] bg-white px-4 py-2.5 mb-4 text-sm outline-none focus:border-[#3B6B35]" />
+            className="w-full rounded-xl border border-[#E3D8C3] bg-white px-4 py-2.5 mb-3 text-sm outline-none focus:border-[#3B6B35]" />
 
           <div className="mb-3">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[#6B5D4F] text-sm">Amount received</span>
-              {paidTouched && Math.abs((+paid||0) - listAmount) > 0.005 && (
-                <button onClick={()=>{setPaid(listAmount.toFixed(2)); setPaidTouched(false);}} className="text-xs text-[#3B6B35] underline">
-                  List price {money(listAmount)}
+              {Math.abs((+paid||0) - listTotal) > 0.005 && (
+                <button onClick={()=>onPaidEdit(listTotal.toFixed(2), false)} className="text-xs text-[#3B6B35] underline">
+                  Bill total {money(listTotal)}
                 </button>
               )}
             </div>
             <input type="number" min="0" inputMode="decimal" value={paid}
-              onChange={e=>{setPaid(e.target.value); setPaidTouched(true);}}
-              placeholder={listAmount.toFixed(2)}
+              onChange={e=>onPaidEdit(e.target.value, true)}
+              placeholder={listTotal.toFixed(2)}
               className="w-full rounded-xl border border-[#E3D8C3] bg-white px-4 py-3 text-right font-display text-2xl font-semibold text-[#3B6B35] outline-none focus:border-[#3B6B35] focus:ring-2 focus:ring-[#3B6B35]/20" />
           </div>
-          <button onClick={save} disabled={saving}
-            className="w-full rounded-xl bg-[#3B6B35] text-white py-3.5 font-semibold text-lg active:scale-[.99] disabled:opacity-60">
+
+          {saveError && (
+            <div className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 mb-3 text-sm text-red-700">
+              <p className="font-semibold mb-0.5">Unable to save sale</p>
+              <p className="mb-2">Please check your connection.</p>
+              <button onClick={onRetry} className="text-red-700 font-semibold underline">Try again</button>
+            </div>
+          )}
+
+          <button onClick={onSave} disabled={saving}
+            className="w-full rounded-xl bg-[#3B6B35] text-white py-4 font-semibold text-lg active:scale-[.99] disabled:opacity-60">
             {saving ? "Saving…" : "Save sale"}
           </button>
+          {canHold && (
+            <button onClick={onHold} disabled={saving} className="w-full mt-2 rounded-xl border border-[#E3D8C3] text-[#6B5D4F] py-2.5 font-semibold text-sm disabled:opacity-60">
+              Hold bill
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function SaleConfirmed({ info, onNew }) {
+  return (
+    <div className="text-center py-8">
+      <div className="w-14 h-14 rounded-full bg-[#3B6B35] text-white grid place-items-center mx-auto mb-4"><I.check className="w-7 h-7"/></div>
+      <p className="font-display text-xl font-semibold text-[#3A2E22]">Sale saved</p>
+      <p className="font-display text-3xl font-semibold text-[#3B6B35] mt-1">{money(info.amount)}</p>
+      <p className="text-sm text-[#8A7B68] mt-1">{info.count} item{info.count!==1?'s':''}</p>
+      <button onClick={onNew} className="w-full mt-6 rounded-xl bg-[#3B6B35] text-white py-4 font-semibold text-lg">New customer</button>
+    </div>
+  );
+}
+
+/* ================= EMPLOYEE — LOG A SALE (POS) ================= */
+function SaleScreen({ products, sales, reload, toast, goOwner, cart, setCart, held, setHeld, lastBill, setLastBill }) {
+  const [q, setQ] = useState("");
+  const [tab, setTab] = useState('quick');
+  const [picker, setPicker] = useState(null);
+  const [name, setName] = useState(localStorage.getItem('dk_seller') || "");
+  const [paid, setPaid] = useState("");
+  const [paidTouched, setPaidTouched] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [billOpen, setBillOpen] = useState(false);
+  const [savedInfo, setSavedInfo] = useState(null);
+
+  const active = products.filter(p => p.active !== false);
+
+  // rank by how often each product has actually been sold — derived from existing sales data, no schema change
+  const freq = {};
+  sales.forEach(s => { freq[s.product_id] = (freq[s.product_id] || 0) + (Number(s.qty) || 1); });
+  const bySales = [...active].sort((a,b) => (freq[b.id]||0) - (freq[a.id]||0));
+  const quick = bySales.slice(0, 8);
+
+  const query = q.trim().toLowerCase();
+  const list = query ? active.filter(p => p.name.toLowerCase().includes(query))
+             : tab === 'quick' ? quick : active;
+
+  const today = sales.filter(s => new Date(s.created_at) >= startOf('today'));
+  const todayTotal = today.reduce((a,s)=>a+Number(s.sale_amount),0);
+
+  const listTotal = cart.reduce((a,i)=>a + saleAmountFor(i.product, i.grams, i.qty), 0);
+
+  useEffect(() => {
+    if (!paidTouched) setPaid(listTotal ? listTotal.toFixed(2) : "");
+  }, [listTotal, paidTouched]);
+
+  const addToCart = (product, grams, qty) => {
+    setCart(prev => {
+      const idx = prev.findIndex(i => i.product.id === product.id && i.grams === grams);
+      if (idx > -1) { const next = [...prev]; next[idx] = { ...next[idx], qty: next[idx].qty + qty }; return next; }
+      return [...prev, { key: product.id + '-' + grams + '-' + Date.now(), product, grams, qty }];
+    });
+    setPaidTouched(false);
+    setPicker(null);
+    setBillOpen(true);
+  };
+
+  const updateQty = (key, delta) => setCart(prev => prev.map(i => i.key === key ? { ...i, qty: Math.max(1, i.qty + delta) } : i));
+  const setQtyExact = (key, qty) => setCart(prev => prev.map(i => i.key === key ? { ...i, qty: Math.max(1, qty) } : i));
+  const removeItem = (key) => setCart(prev => prev.filter(i => i.key !== key));
+  const changeGrams = (key, grams) => setCart(prev => prev.map(i => i.key === key ? { ...i, grams } : i));
+
+  const clearCart = () => { setCart([]); setPaid(""); setPaidTouched(false); setSaveError(""); };
+
+  // splits the actual amount received across cart lines proportional to list price,
+  // so a bargained total still yields a sale_amount/profit per existing sales-table row
+  const saveBill = async () => {
+    if (!cart.length) return;
+    const totalReceived = +paid || 0;
+    if (totalReceived <= 0) { toast("Enter the amount received"); return; }
+    setSaving(true); setSaveError("");
+    localStorage.setItem('dk_seller', name);
+
+    const items = cart.map(i => ({
+      product_id: i.product.id, product_name: i.product.name, grams: i.grams, qty: i.qty,
+      cost_amount: costAmountFor(i.product, i.grams, i.qty),
+      list_amount: saleAmountFor(i.product, i.grams, i.qty)
+    }));
+    const listSum = items.reduce((a,i)=>a+i.list_amount,0) || 1;
+    let allocated = 0;
+    const rows = items.map((it, idx) => {
+      const sale_amount = idx === items.length - 1
+        ? Math.round((totalReceived - allocated) * 100) / 100
+        : Math.round((it.list_amount / listSum) * totalReceived * 100) / 100;
+      allocated += sale_amount;
+      return {
+        product_id: it.product_id, product_name: it.product_name, grams: it.grams, qty: it.qty,
+        sale_amount, cost_amount: it.cost_amount, profit: sale_amount - it.cost_amount, sold_by: name || null
+      };
+    });
+
+    const { error } = await sb.from('sales').insert(rows);
+    setSaving(false);
+    if (error) { setSaveError(error.message || "Couldn't save — check connection"); return; }
+
+    setLastBill(cart);
+    setSavedInfo({ amount: totalReceived, count: cart.length });
+    setCart([]); setPaid(""); setPaidTouched(false); setSaveError("");
+    reload();
+  };
+
+  const newCustomer = () => { setSavedInfo(null); clearCart(); setBillOpen(false); };
+
+  const repeatLast = () => {
+    if (!lastBill || !lastBill.length) return;
+    const restored = lastBill.map(i => {
+      const p = products.find(pr => pr.id === i.product.id) || i.product;
+      return { key: p.id + '-' + i.grams + '-' + Date.now() + '-' + Math.random(), product: p, grams: i.grams, qty: i.qty };
+    });
+    setCart(restored); setPaidTouched(false); setBillOpen(true);
+  };
+
+  const holdBill = () => {
+    if (!cart.length) return;
+    setHeld(prev => [...prev, { id: Date.now(), items: cart, name }]);
+    clearCart(); setBillOpen(false);
+    toast("Bill held");
+  };
+  const resumeHeld = (id) => {
+    const h = held.find(x => x.id === id);
+    if (!h) return;
+    setCart(h.items); setName(h.name || name);
+    setHeld(prev => prev.filter(x => x.id !== id));
+    setPaidTouched(false); setBillOpen(true);
+  };
+
+  const onPaidEdit = (val, touched) => { setPaid(val); setPaidTouched(touched); };
+
+  return (
+    <div className="max-w-md lg:max-w-5xl mx-auto px-4 pb-28 lg:pb-10">
+      <header className="pt-6 pb-3 flex items-center justify-between">
+        <div>
+          <p className="text-[#6B5D4F] text-sm">{CFG.SHOP_NAME}</p>
+          <h1 className="font-display text-2xl font-semibold text-[#3B6B35] leading-tight">Sell</h1>
+        </div>
+        <button onClick={goOwner} aria-label="Owner login" className="flex items-center gap-1.5 text-sm text-[#6B5D4F] px-3 py-1.5 rounded-full border border-[#E3D8C3] active:bg-[#F2EAD8]">
+          <I.lock className="w-3.5 h-3.5" /> Owner
+        </button>
+      </header>
+
+      <p className="text-sm text-[#6B5D4F] mb-3">Today <span className="font-semibold text-[#3A2E22]">{money(todayTotal)}</span> · {today.length} sale{today.length!==1?'s':''}</p>
+
+      {(lastBill?.length > 0 || held.length > 0) && (
+        <div className="flex items-center gap-2 mb-3 overflow-x-auto">
+          {lastBill?.length > 0 && (
+            <button onClick={repeatLast} className="shrink-0 flex items-center gap-1.5 text-sm font-semibold text-[#3B6B35] border border-[#CFE0BD] rounded-full px-3.5 py-2">
+              ↶ Repeat last bill
+            </button>
+          )}
+          {held.map(h => (
+            <button key={h.id} onClick={()=>resumeHeld(h.id)} className="shrink-0 flex items-center gap-1.5 text-sm font-semibold text-[#B8791E] border border-[#EAD2A0] rounded-full px-3.5 py-2">
+              ⏸ Pending · {h.items.length} item{h.items.length!==1?'s':''}
+            </button>
+          ))}
         </div>
       )}
 
-      {/* today's list */}
-      {today.length > 0 && !pick && (
-        <div className="mt-6">
-          <p className="text-xs font-semibold uppercase tracking-wide text-[#6B5D4F] mb-2">Today's sales</p>
-          <div className="space-y-1.5">
-            {today.slice(0,20).map(s => (
-              <div key={s.id} className="flex items-center justify-between bg-white rounded-lg border border-[#EEE4D2] px-3.5 py-2.5">
-                <div className="min-w-0">
-                  <p className="font-medium text-sm truncate">{s.product_name} <span className="text-[#8A7B68]">· {gramsLabel(s.grams)}{s.qty>1?` ×${s.qty}`:''}</span></p>
-                  <p className="text-xs text-[#A89A85]">{fmtDate(s.created_at)}{s.sold_by?` · ${s.sold_by}`:''}</p>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="font-semibold text-sm">{money(s.sale_amount)}</span>
-                  <button onClick={()=>del(s.id)} className="text-[#C77] p-1" aria-label="Remove"><I.trash className="w-4 h-4"/></button>
-                </div>
-              </div>
-            ))}
+      <input value={q} onChange={e=>setQ(e.target.value)} placeholder="🔍 Search product…"
+        className="w-full rounded-xl border border-[#E3D8C3] bg-white px-4 py-3 mb-3 outline-none focus:border-[#3B6B35] focus:ring-2 focus:ring-[#3B6B35]/20" />
+
+      {!query && (
+        <div className="flex gap-1.5 mb-3 bg-[#F1E9D7] p-1 rounded-full w-fit">
+          {[['quick','⭐ Quick sell'],['all','All']].map(([k,l]) => (
+            <button key={k} onClick={()=>setTab(k)}
+              className={"px-4 py-1.5 rounded-full text-sm font-semibold transition " + (tab===k?"bg-white text-[#3B6B35] shadow-sm":"text-[#8A7B68]")}>{l}</button>
+          ))}
+        </div>
+      )}
+
+      <div className="lg:grid lg:grid-cols-[1fr,380px] lg:gap-6 lg:items-start">
+        <div>
+          {active.length === 0 ? (
+            <p className="text-center text-[#8A7B68] py-10 text-sm">No products yet. Ask the owner to add them.</p>
+          ) : list.length === 0 ? (
+            <p className="text-center text-[#8A7B68] py-10 text-sm">No products match "{q}".</p>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+              {list.map(p => (
+                <button key={p.id} onClick={()=>setPicker(p)}
+                  className="text-left rounded-xl border border-[#E3D8C3] bg-white px-4 py-3.5 active:scale-[.98] active:bg-[#F7F1E3] transition">
+                  <p className="font-semibold text-[#3A2E22] leading-snug">{p.name}</p>
+                  <p className="text-sm text-[#8A7B68] mt-0.5">{money(p.price_per_100g)}<span className="text-xs">{unitSuffix(p)}</span></p>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* desktop bill column */}
+        <div className="hidden lg:block bg-white rounded-2xl border border-[#E3D8C3] p-4 sticky top-4">
+          {savedInfo ? (
+            <SaleConfirmed info={savedInfo} onNew={newCustomer} />
+          ) : (
+            <BillPanel cart={cart} updateQty={updateQty} setQtyExact={setQtyExact} removeItem={removeItem} changeGrams={changeGrams}
+              name={name} setName={setName} paid={paid} onPaidEdit={onPaidEdit}
+              listTotal={listTotal} onSave={saveBill} saving={saving} saveError={saveError} onRetry={saveBill}
+              onHold={holdBill} canHold={cart.length>0} onClose={()=>{}} />
+          )}
+        </div>
+      </div>
+
+      {/* mobile sticky bar */}
+      {!billOpen && cart.length > 0 && !savedInfo && (
+        <button onClick={()=>setBillOpen(true)}
+          className="lg:hidden fixed bottom-0 inset-x-0 bg-[#3B6B35] text-white px-5 py-3.5 flex items-center justify-between z-30">
+          <span className="text-sm">{cart.length} item{cart.length>1?'s':''} · {money(listTotal)}</span>
+          <span className="font-semibold text-sm">View bill →</span>
+        </button>
+      )}
+
+      {/* mobile bill sheet */}
+      {(billOpen || savedInfo) && (
+        <div className="lg:hidden fixed inset-0 z-40 flex items-end bg-black/40" onClick={()=>!savedInfo && setBillOpen(false)}>
+          <div onClick={e=>e.stopPropagation()} className="w-full bg-white rounded-t-3xl p-5 max-h-[90vh] overflow-y-auto">
+            {savedInfo ? (
+              <SaleConfirmed info={savedInfo} onNew={newCustomer} />
+            ) : (
+              <BillPanel cart={cart} updateQty={updateQty} setQtyExact={setQtyExact} removeItem={removeItem} changeGrams={changeGrams}
+                name={name} setName={setName} paid={paid} onPaidEdit={onPaidEdit}
+                listTotal={listTotal} onSave={saveBill} saving={saving} saveError={saveError} onRetry={saveBill}
+                onHold={holdBill} canHold={cart.length>0} onClose={()=>setBillOpen(false)} />
+            )}
           </div>
         </div>
       )}
+
+      {picker && <ProductPicker product={picker} onAdd={addToCart} onClose={()=>setPicker(null)} />}
     </div>
   );
 }
@@ -333,6 +568,8 @@ function Dashboard({ sales }) {
     byProd[k].qty += s.qty; byProd[k].sales += Number(s.sale_amount); byProd[k].profit += Number(s.profit);
   });
   const prodRows = Object.values(byProd).sort((a,b)=>b.profit-a.profit);
+  const bestSellers = [...prodRows].sort((a,b)=>b.qty-a.qty).slice(0,4);
+  const mostProfitable = prodRows.slice(0,3);
 
   // last 7 days profit bars
   const days = [...Array(7)].map((_,i)=>{ const d=new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate()-(6-i)); return d; });
@@ -365,6 +602,33 @@ function Dashboard({ sales }) {
         <Stat label="Profit" val={money(totalProfit)} tone={totalProfit>=0?"text-[#3B6B35]":"text-red-600"} />
         <Stat label="Margin" val={margin.toFixed(1)+"%"} tone="text-[#B8791E]" />
       </div>
+
+      {prodRows.length>0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 mb-3">
+          <div className="rounded-2xl bg-white border border-[#EEE4D2] p-4">
+            <p className="text-xs uppercase tracking-wide text-[#8A7B68] mb-2">Best sellers</p>
+            <ol className="space-y-1.5 text-sm">
+              {bestSellers.map((r,i)=>(
+                <li key={r.name} className="flex items-center justify-between">
+                  <span className="text-[#3A2E22] truncate pr-2">{i+1}. {r.name}</span>
+                  <span className="text-[#8A7B68] shrink-0">{r.qty}</span>
+                </li>
+              ))}
+            </ol>
+          </div>
+          <div className="rounded-2xl bg-white border border-[#EEE4D2] p-4">
+            <p className="text-xs uppercase tracking-wide text-[#8A7B68] mb-2">Most profitable</p>
+            <ol className="space-y-1.5 text-sm">
+              {mostProfitable.map((r,i)=>(
+                <li key={r.name} className="flex items-center justify-between">
+                  <span className="text-[#3A2E22] truncate pr-2">{i+1}. {r.name}</span>
+                  <span className="font-semibold text-[#3B6B35] shrink-0">{money(r.profit)}</span>
+                </li>
+              ))}
+            </ol>
+          </div>
+        </div>
+      )}
 
       <div className="rounded-2xl bg-white border border-[#EEE4D2] p-4 mb-3">
         <p className="text-xs uppercase tracking-wide text-[#8A7B68] mb-3">Profit — last 7 days</p>
@@ -422,7 +686,7 @@ function RecentSales({ sales, reload }) {
         {sales.slice(0,80).map(s=>(
           <div key={s.id} className="flex items-center justify-between bg-white rounded-lg border border-[#EEE4D2] px-3.5 py-2.5">
             <div className="min-w-0">
-              <p className="font-medium text-sm truncate">{s.product_name} <span className="text-[#8A7B68]">· {gramsLabel(s.grams)}{s.qty>1?` ×${s.qty}`:''}</span></p>
+              <p className="font-medium text-sm truncate">{s.product_name} <span className="text-[#8A7B68]">· {s.grams>0 ? gramsLabel(s.grams)+(s.qty>1?` ×${s.qty}`:'') : `${s.qty} packet${s.qty>1?'s':''}`}</span></p>
               <p className="text-xs text-[#A89A85]">{fmtDate(s.created_at)}{s.sold_by?` · ${s.sold_by}`:''}</p>
             </div>
             <div className="flex items-center gap-3 shrink-0 text-right">
@@ -439,26 +703,27 @@ function RecentSales({ sales, reload }) {
 
 /* ================= OWNER — PRODUCTS ================= */
 function Products({ products, reload, toast }) {
-  const [form, setForm] = useState({ name:"", cost:"", price:"" });
+  const [form, setForm] = useState({ name:"", cost:"", price:"", unit:"weight" });
   const [editId, setEditId] = useState(null);
-  const [edit, setEdit] = useState({ cost:"", price:"" });
+  const [edit, setEdit] = useState({ cost:"", price:"", unit:"weight" });
   const [csv, setCsv] = useState(""); const [showImport, setShowImport] = useState(false);
 
   const add = async () => {
     if (!form.name.trim()) return;
-    const { error } = await sb.from('products').insert({ name:form.name.trim(), cost_per_100g:+form.cost||0, price_per_100g:+form.price||0 });
+    const { error } = await sb.from('products').insert({ name:form.name.trim(), cost_per_100g:+form.cost||0, price_per_100g:+form.price||0, unit:form.unit });
     if (error) { toast("Couldn't add"); return; }
-    setForm({name:"",cost:"",price:""}); toast("Product added"); reload();
+    setForm({name:"",cost:"",price:"",unit:"weight"}); toast("Product added"); reload();
   };
   const saveEdit = async (id) => {
-    await sb.from('products').update({ cost_per_100g:+edit.cost||0, price_per_100g:+edit.price||0 }).eq('id',id);
+    await sb.from('products').update({ cost_per_100g:+edit.cost||0, price_per_100g:+edit.price||0, unit:edit.unit }).eq('id',id);
     setEditId(null); reload();
   };
   const toggle = async (p) => { await sb.from('products').update({ active: p.active===false }).eq('id',p.id); reload(); };
   const remove = async (id) => { if(!confirm("Delete product? Past sales stay.")) return; await sb.from('products').delete().eq('id',id); reload(); };
   const importCsv = async () => {
     const rows = csv.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).map(l=>{
-      const [name,cost,price] = l.split(","); return { name:(name||"").trim(), cost_per_100g:+cost||0, price_per_100g:+price||0 };
+      const [name,cost,price,unit] = l.split(",");
+      return { name:(name||"").trim(), cost_per_100g:+cost||0, price_per_100g:+price||0, unit: (unit||"").trim().toLowerCase()==='packet' ? 'packet' : 'weight' };
     }).filter(r=>r.name && r.name.toLowerCase()!=='name');
     if (!rows.length) return;
     const { error } = await sb.from('products').insert(rows);
@@ -466,24 +731,36 @@ function Products({ products, reload, toast }) {
     setCsv(""); setShowImport(false); toast(`${rows.length} products added`); reload();
   };
 
+  const UnitToggle = ({ value, onChange }) => (
+    <div className="flex gap-1.5 bg-[#F1E9D7] p-1 rounded-full">
+      {[['weight','Weight'],['packet','Packet']].map(([k,l])=>(
+        <button key={k} type="button" onClick={()=>onChange(k)}
+          className={"flex-1 py-1.5 rounded-full text-xs font-semibold transition " + (value===k?"bg-white text-[#3B6B35] shadow-sm":"text-[#8A7B68]")}>{l}</button>
+      ))}
+    </div>
+  );
+
   return (
     <div>
       <div className="rounded-2xl bg-white border border-[#EEE4D2] p-4 mb-4">
         <p className="text-xs uppercase tracking-wide text-[#8A7B68] mb-2">Add product</p>
         <input value={form.name} onChange={e=>setForm({...form,name:e.target.value})} placeholder="Product name"
           className="w-full rounded-lg border border-[#E3D8C3] px-3 py-2 mb-2 outline-none focus:border-[#3B6B35]" />
+        <div className="mb-2">
+          <UnitToggle value={form.unit} onChange={u=>setForm({...form,unit:u})} />
+        </div>
         <div className="grid grid-cols-2 gap-2 mb-3">
-          <input value={form.cost} onChange={e=>setForm({...form,cost:e.target.value})} inputMode="decimal" placeholder="Cost /100g"
+          <input value={form.cost} onChange={e=>setForm({...form,cost:e.target.value})} inputMode="decimal" placeholder={form.unit==='packet'?"Cost /packet":"Cost /100g"}
             className="rounded-lg border border-[#E3D8C3] px-3 py-2 outline-none focus:border-[#3B6B35]" />
-          <input value={form.price} onChange={e=>setForm({...form,price:e.target.value})} inputMode="decimal" placeholder="Sell /100g"
+          <input value={form.price} onChange={e=>setForm({...form,price:e.target.value})} inputMode="decimal" placeholder={form.unit==='packet'?"Sell /packet":"Sell /100g"}
             className="rounded-lg border border-[#E3D8C3] px-3 py-2 outline-none focus:border-[#3B6B35]" />
         </div>
         <button onClick={add} className="w-full flex items-center justify-center gap-1.5 rounded-lg bg-[#3B6B35] text-white py-2.5 font-semibold"><I.plus className="w-4 h-4"/> Add</button>
         <button onClick={()=>setShowImport(!showImport)} className="w-full mt-2 text-sm text-[#6B5D4F]">{showImport?"Hide bulk import":"Bulk import from CSV"}</button>
         {showImport && (
           <div className="mt-2">
-            <p className="text-xs text-[#8A7B68] mb-1">One product per line: <code>name,cost,sell</code></p>
-            <textarea value={csv} onChange={e=>setCsv(e.target.value)} rows="4" placeholder={"Cashew,72,90\nPista Plain,240,290"}
+            <p className="text-xs text-[#8A7B68] mb-1">One product per line: <code>name,cost,sell,unit</code> — unit is optional, "weight" (default) or "packet"</p>
+            <textarea value={csv} onChange={e=>setCsv(e.target.value)} rows="4" placeholder={"Cashew,72,90\nPista Plain,240,290\nGift Box,150,220,packet"}
               className="w-full rounded-lg border border-[#E3D8C3] px-3 py-2 text-sm outline-none focus:border-[#3B6B35]" />
             <button onClick={importCsv} className="w-full mt-2 rounded-lg bg-[#B8791E] text-white py-2 font-semibold text-sm">Import</button>
           </div>
@@ -495,20 +772,23 @@ function Products({ products, reload, toast }) {
         {products.map(p=>(
           <div key={p.id} className={"bg-white rounded-lg border border-[#EEE4D2] px-3.5 py-2.5 " + (p.active===false?"opacity-50":"")}>
             {editId===p.id ? (
-              <div className="flex items-center gap-2">
-                <span className="flex-1 font-medium text-sm truncate">{p.name}</span>
-                <input value={edit.cost} onChange={e=>setEdit({...edit,cost:e.target.value})} className="w-16 rounded border border-[#E3D8C3] px-2 py-1 text-sm" placeholder="cost"/>
-                <input value={edit.price} onChange={e=>setEdit({...edit,price:e.target.value})} className="w-16 rounded border border-[#E3D8C3] px-2 py-1 text-sm" placeholder="sell"/>
-                <button onClick={()=>saveEdit(p.id)} className="text-[#3B6B35] font-semibold text-sm">Save</button>
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="flex-1 font-medium text-sm truncate">{p.name}</span>
+                  <input value={edit.cost} onChange={e=>setEdit({...edit,cost:e.target.value})} className="w-16 rounded border border-[#E3D8C3] px-2 py-1 text-sm" placeholder="cost"/>
+                  <input value={edit.price} onChange={e=>setEdit({...edit,price:e.target.value})} className="w-16 rounded border border-[#E3D8C3] px-2 py-1 text-sm" placeholder="sell"/>
+                  <button onClick={()=>saveEdit(p.id)} className="text-[#3B6B35] font-semibold text-sm">Save</button>
+                </div>
+                <UnitToggle value={edit.unit} onChange={u=>setEdit({...edit,unit:u})} />
               </div>
             ) : (
               <div className="flex items-center justify-between">
                 <div className="min-w-0">
                   <p className="font-medium text-sm truncate">{p.name}</p>
-                  <p className="text-xs text-[#8A7B68]">Cost {money(p.cost_per_100g)} · Sell {money(p.price_per_100g)} · <span className="text-[#3B6B35]">Margin {p.price_per_100g?(((p.price_per_100g-p.cost_per_100g)/p.price_per_100g)*100).toFixed(0):0}%</span></p>
+                  <p className="text-xs text-[#8A7B68]">Cost {money(p.cost_per_100g)} · Sell {money(p.price_per_100g)} {unitSuffix(p)} · <span className="text-[#3B6B35]">Margin {p.price_per_100g?(((p.price_per_100g-p.cost_per_100g)/p.price_per_100g)*100).toFixed(0):0}%</span></p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0 text-sm">
-                  <button onClick={()=>{setEditId(p.id); setEdit({cost:p.cost_per_100g, price:p.price_per_100g});}} className="text-[#6B5D4F]">Edit</button>
+                  <button onClick={()=>{setEditId(p.id); setEdit({cost:p.cost_per_100g, price:p.price_per_100g, unit:p.unit||'weight'});}} className="text-[#6B5D4F]">Edit</button>
                   <button onClick={()=>toggle(p)} className="text-[#8A7B68]">{p.active===false?"Show":"Hide"}</button>
                   <button onClick={()=>remove(p.id)} className="text-[#C77]"><I.trash className="w-4 h-4"/></button>
                 </div>
@@ -559,6 +839,12 @@ function App() {
   const [toastMsg, setToastMsg] = useState("");
   const toast = (m)=>{ setToastMsg(m); setTimeout(()=>setToastMsg(""),1800); };
 
+  // frontend-only POS cart state — lifted here (not in SaleScreen) so it survives
+  // navigating to Owner and back, and is untouched by product/sales realtime reloads
+  const [cart, setCart] = useState([]);
+  const [held, setHeld] = useState([]);
+  const [lastBill, setLastBill] = useState(null);
+
   const reload = useCallback(async () => {
     const [{ data: p }, { data: s }] = await Promise.all([
       sb.from('products').select('*').order('name'),
@@ -578,7 +864,8 @@ function App() {
 
   return (
     <>
-      {view==='sale'  && <SaleScreen products={products} sales={sales} reload={reload} toast={toast} goOwner={()=>setView('gate')} />}
+      {view==='sale'  && <SaleScreen products={products} sales={sales} reload={reload} toast={toast} goOwner={()=>setView('gate')}
+        cart={cart} setCart={setCart} held={held} setHeld={setHeld} lastBill={lastBill} setLastBill={setLastBill} />}
       {view==='gate'  && <PinGate onOk={()=>setView('owner')} onBack={()=>setView('sale')} />}
       {view==='owner' && <Owner products={products} sales={sales} reload={reload} toast={toast} onBack={()=>setView('sale')} />}
       <Toast msg={toastMsg} />
